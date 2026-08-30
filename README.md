@@ -4,6 +4,8 @@
 
 采用**双板架构**:一块专门跑 WiFi 网页服务，一块专门跑蓝牙 HID，两块之间用串口通信。两个射频(WiFi / 蓝牙)物理隔离，从根本上避免了单板上 WiFi 与 BLE 共存时的相互干扰、内存不足和卡死问题，适合长期稳定运行。
 
+> 📖 **第一次用 Arduino / 不熟悉烧录环境?** 请先看 [Arduino_Readme.md](./Arduino_Readme.md),里面有从零安装 Arduino IDE、ESP32 支持包、依赖库到烧录的完整图文步骤。
+
 ---
 
 ## 功能特性
@@ -49,6 +51,23 @@
 
 ---
 
+## 目录结构
+
+```
+esp32controlios/
+├── esp32/            # 两块板的固件(.ino)
+│   ├── A 板固件(.ino)   —— WiFi 网关 + 网页 + 串口转发
+│   └── B 板固件(.ino)   —— BLE 键鼠 + 绝对定位 + 断线重连
+├── libraries/        # 依赖库(含本项目修改版蓝牙库)
+│   └── ESP32_BLE_Combo_Keyboard_Mouse/   # 修改版:新增绝对定位能力
+├── Arduino_Readme.md # Arduino 环境安装 + 烧录 完整教程
+└── README.md
+```
+
+> 每块板对应 `esp32/` 目录里的一个 `.ino` 文件,分别烧录到两块 ESP32。
+
+---
+
 ## 一、硬件购买清单
 
 | 物品 | 数量 | 说明 |
@@ -57,7 +76,7 @@
 | USB 数据线 (Micro-USB 或 Type-C，看板子接口) | 2 | 用于给两块板供电和烧录。**要数据线，不是纯充电线** |
 | 杜邦线 (母对母 / 双母头) | 2~3 根 | 淘宝搜 "杜邦线 母对母"，几块钱一排。用于两板互联 |
 
-> **说明**:本项目使用的是不带 PSRAM 的 ESP32-WROOM-32E，普通开发板即可，无需任何特殊型号。带 CH340 USB 芯片的板子在 Linux 下免驱、Windows 需装 CH340 驱动。
+> **说明**:本项目使用不带 PSRAM 的 ESP32-WROOM-32E，普通开发板即可，无需任何特殊型号。带 CH340 USB 芯片的板子在 Linux 下免驱、Windows 需装 CH340 驱动。
 
 **可选(长期固定用)**:
 - 亚克力底板 + 铜柱(搜 "ESP32 亚克力底板"),把两块板固定在一起，防止杜邦线松脱
@@ -96,70 +115,20 @@
 
 ---
 
-## 三、软件环境准备
+## 三、烧录与配置
 
-### 1. 安装 Arduino IDE 与 ESP32 支持
+完整的环境安装、烧录、配对步骤请见 **[Arduino_Readme.md](./Arduino_Readme.md)**。这里是速览:
 
-1. 安装 [Arduino IDE](https://www.arduino.cc/en/software)(2.x 版本)
-2. **文件 → 首选项 → 附加开发板管理器网址** 填入:
-   ```
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-   ```
-3. **工具 → 开发板 → 开发板管理器**,搜索 `esp32` 并安装
-4. 开发板选择 **ESP32 Dev Module**
+1. **装环境**:Arduino IDE + ESP32 支持包 + 依赖库(异步库 `ESPAsyncWebServer`/`AsyncTCP`,以及本仓库 `libraries/` 里的修改版蓝牙库)
+2. **烧 A 板**:打开 `esp32/` 里的 A 板固件,改好 WiFi 名称/密码,烧录;串口(115200)记下打印的 IP
+3. **烧 B 板**:打开 `esp32/` 里的 B 板固件,烧录
+4. **两块板都上电**,按下方"配对与使用"
 
-### 2. 安装依赖库
-
-**A 板(WiFi 网关)需要异步 Web 服务器库:**
-
-- [`ESPAsyncWebServer`](https://github.com/ESP32Async/ESPAsyncWebServer)
-- [`AsyncTCP`](https://github.com/ESP32Async/AsyncTCP)(ESPAsyncWebServer 的依赖)
-
-> 可在库管理器搜索安装，或下载 zip 后 **项目 → 加载库 → 添加 .ZIP 库**。
-
-**B 板(BLE 键鼠)需要蓝牙键鼠组合库(含本项目的绝对定位改动):**
-
-- `ESP32-BLE-Combo`(基于 [blackketter/ESP32-BLE-Combo](https://github.com/blackketter/ESP32-BLE-Combo))
-
-> ⚠️ **重要**:本项目对该库做了扩展，**新增了绝对定位(Absolute Pointer)能力**。请使用本仓库 `lib/` 目录下提供的修改版库文件，**不要直接用原版库**，否则绝对定位、点击等功能无法工作。详见下方 [库改动说明](#库改动说明)。
-
-安装方式:把本仓库 `lib/ESP32_BLE_Combo_Keyboard_Mouse/` 整个文件夹复制到你的 Arduino 库目录:
-- Windows: `C:\Users\<用户名>\Documents\Arduino\libraries\`
-- macOS: `~/Documents/Arduino/libraries/`
-- Linux: `~/Arduino/libraries/`
+> ⚠️ **关键**:B 板必须使用本仓库 `libraries/ESP32_BLE_Combo_Keyboard_Mouse/` 里的**修改版库**(新增了绝对定位能力),不要用原版库,否则绝对定位、点击无法工作。安装方法见 Arduino_Readme.md。
 
 ---
 
-## 四、烧录
-
-**两块板轮流烧录，一次只插一块**(两块同时插会分不清串口)。
-
-### 烧 A 板(WiFi 网关)
-
-1. 打开 `A_board_WiFi_gateway.ino`
-2. **修改 WiFi 配置**(文件顶部):
-   ```cpp
-   const char* WIFI_SSID = "你的WiFi名称";   // 注意:ESP32 只支持 2.4G，别填 5G
-   const char* WIFI_PASS = "你的WiFi密码";
-   ```
-3. 只插 A 板到电脑 USB
-4. **工具 → 开发板**:ESP32 Dev Module;**工具 → 端口**:选出现的串口
-5. 点 **✓ 编译** → 通过后点 **→ 上传**
-6. 打开**串口监视器(115200)**，记下打印的 IP 地址,例如 `http://192.168.1.xx`
-
-### 烧 B 板(BLE 键鼠)
-
-1. 拔掉 A 板，只插 B 板
-2. 打开 `B_board_BLE_hid.ino`
-3. **工具 → 端口**:重新选择 B 板的串口
-4. 点 **✓ 编译** → **→ 上传**
-5. 串口监视器应显示 `BLE 键鼠已启动(等待 iPhone 配对)`
-
-> 如果上传卡在 `Connecting...`，按住板子上的 **BOOT** 键，等开始写入再松手。
-
----
-
-## 五、配对与使用
+## 四、配对与使用
 
 1. **两块板都上电**(各自 USB 供电，接线保持连接)
 2. **iPhone 配对 B 板**:
@@ -175,7 +144,7 @@
 
 ---
 
-## 六、网页面板说明
+## 五、网页面板说明
 
 | 区域 | 功能 |
 |------|------|
@@ -191,7 +160,7 @@
 
 ---
 
-## 七、故障排查
+## 六、故障排查
 
 | 现象 | 可能原因与解决 |
 |------|----------------|
@@ -225,19 +194,6 @@
 
 ---
 
-## 目录结构
-
-```
-.
-├── A_board_WiFi_gateway.ino      # A 板固件:WiFi 网关 + 网页 + 串口转发
-├── B_board_BLE_hid.ino           # B 板固件:BLE 键鼠 + 绝对定位 + 断线重连
-├── lib/
-│   └── ESP32_BLE_Combo_Keyboard_Mouse/   # 修改版蓝牙库(含绝对定位)
-└── README.md
-```
-
----
-
 ## 指令协议(A 板 → B 板,串口)
 
 每条指令一行,以 `\n` 结尾,格式 `类型:参数`:
@@ -261,4 +217,3 @@
 - 异步 Web 服务器基于 [ESP32Async/ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
 
 本项目仅供学习与个人自动化用途，请遵守相关设备的使用条款。
-```
