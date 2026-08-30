@@ -1,0 +1,159 @@
+#include <BleCombo.h>
+#include <BLEDevice.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+// ================== B 板 · BLE 键鼠执行端(只跑蓝牙,不碰 WiFi)==================
+// 职责:从 Serial2 接收 A 板转发来的指令(按行),解析并执行 BLE 键鼠/绝对定位。
+// 接线:B板 D16(RX2) ← A板 D17(TX2);B板 GND → A板 GND(共地)。
+// 稳定性:蓝牙未连接时,每 2 秒自动重开广播 → 断线后 iPhone 可自动重连,适合长期挂机。
+// 依赖:BleCombo 库已加 ABS_MOUSE_ID(0x04) + moveTo + moveToWithButtons + clickAbs。
+// ==============================================================================
+
+// ---------- 串口(收 A 板)----------
+#define LINK_BAUD   115200
+#define LINK_RX_PIN 16   // B板 D16 ← A板 D17
+#define LINK_TX_PIN 17   // 回传蓝牙状态给 A 板(需接 B板D17→A板D16)
+
+// ---------- 命令队列 ----------
+#define CMD_MAXLEN    160
+#define CMD_QUEUE_LEN 24
+struct CmdItem { char data[CMD_MAXLEN]; };
+QueueHandle_t cmdQueue = nullptr;
+
+// ================== 组合键 & 指令处理 ==================
+void combo(uint8_t modifier, uint8_t key) {
+  Keyboard.press(modifier);
+  Keyboard.press(key);
+  delay(50);
+  Keyboard.releaseAll();
+}
+
+void handle(String cmd) {
+  if (!Keyboard.isConnected() || cmd.length() < 2) return;
+  char t = cmd.charAt(0);
+  String a = cmd.substring(2);
+  if (t == 'T') {
+    Keyboard.print(a);
+  } else if (t == 'K') {
+    if      (a == "RETURN")    Keyboard.write(KEY_RETURN);
+    else if (a == "ESC")       Keyboard.write(KEY_ESC);
+    else if (a == "TAB")       Keyboard.write(KEY_TAB);
+    else if (a == "BACKSPACE") Keyboard.write(KEY_BACKSPACE);
+    else if (a == "SPACE")     Keyboard.write(' ');
+    else if (a == "UP")        Keyboard.write(KEY_UP_ARROW);
+    else if (a == "DOWN")      Keyboard.write(KEY_DOWN_ARROW);
+    else if (a == "LEFT")      Keyboard.write(KEY_LEFT_ARROW);
+    else if (a == "RIGHT")     Keyboard.write(KEY_RIGHT_ARROW);
+    else if (a == "PGUP")      Keyboard.write(KEY_PAGE_UP);
+    else if (a == "PGDN")      Keyboard.write(KEY_PAGE_DOWN);
+    else if (a == "HOME")      Keyboard.write(KEY_HOME);
+    else if (a == "END")       Keyboard.write(KEY_END);
+  } else if (t == 'H') {
+    if      (a == "HOME")   combo(KEY_LEFT_GUI, 'h');
+    else if (a == "SEARCH") combo(KEY_LEFT_GUI, ' ');
+    else if (a == "SWITCH") combo(KEY_LEFT_GUI, KEY_TAB);
+    else if (a == "ALTD")   combo(KEY_LEFT_ALT, 'd');
+    else if (a == "ADDR")   combo(KEY_LEFT_GUI, 'l');
+  } else if (t == 'M') {                            // 相对移动(拆步防溢出)
+    int p = a.indexOf(',');
+    if (p > 0) {
+      int dx = a.substring(0, p).toInt();
+      int dy = a.substring(p + 1).toInt();
+      while (dx != 0 || dy != 0) {
+        int sx = constrain(dx, -127, 127);
+        int sy = constrain(dy, -127, 127);
+        Mouse.move(sx, sy);
+        dx -= sx;  dy -= sy;
+      }
+    }
+  } else if (t == 'P') {                            // 绝对定位 P:x,y  (0..32767)
+    int p = a.indexOf(',');
+    if (p > 0) {
+      int x = constrain(a.substring(0, p).toInt(), 0, 32767);
+      int y = constrain(a.substring(p + 1).toInt(), 0, 32767);
+      Mouse.moveTo(x, y);
+    }
+  } else if (t == 'Q') {                            // 绝对定位并点击 Q:x,y(绝对通道闭环)
+    int p = a.indexOf(',');
+    if (p > 0) {
+      int x = constrain(a.substring(0, p).toInt(), 0, 32767);
+      int y = constrain(a.substring(p + 1).toInt(), 0, 32767);
+      Mouse.moveToWithButtons(x, y, 0);
+      delay(40);
+      Mouse.moveToWithButtons(x, y, 1);
+      delay(60);
+      Mouse.moveToWithButtons(x, y, 0);
+    }
+  } else if (t == 'C') {                            // 点击:在最后一次绝对定位坐标处点击
+    Mouse.clickAbs();
+  } else if (t == 'S') {                            // 滚轮(拆步,间隔小一点更快)
+    int w = a.toInt();
+    while (w != 0) {
+      int sw = constrain(w, -127, 127);
+      Mouse.move(0, 0, sw);
+      w -= sw;
+      delay(3);
+    }
+  }
+}
+
+// ============================ 启动 ============================
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+
+  Serial.println();
+  Serial.println("==== B 板 · BLE 键鼠执行端启动 ====");
+
+  cmdQueue = xQueueCreate(CMD_QUEUE_LEN, sizeof(CmdItem));
+
+  Keyboard.begin();
+  Mouse.begin();
+  Serial.println("BLE 键鼠已启动(等待 iPhone 配对)");
+}
+
+// ============================ 主循环 ============================
+void loop() {
+  // 1) 从 Serial2 按行读取 A 板发来的指令,入队
+  static String rx;
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\n') {
+      rx.trim();
+      if (rx.length() >= 2 && cmdQueue) {
+        CmdItem item;
+        snprintf(item.data, CMD_MAXLEN, "%s", rx.c_str());
+        xQueueSend(cmdQueue, &item, 0);
+      }
+      rx = "";
+    } else if (rx.length() < CMD_MAXLEN - 1) {
+      rx += c;
+    }
+  }
+
+  // 2) 排空队列,执行 BLE 操作
+  CmdItem item;
+  while (cmdQueue && xQueueReceive(cmdQueue, &item, 0) == pdTRUE) {
+    handle(String(item.data));
+  }
+
+  // 3) 心跳 + 断线自动重广播 + 回传状态
+  static unsigned long lastBeat = 0;
+  if (millis() - lastBeat > 2000) {
+    lastBeat = millis();
+    bool conn = Keyboard.isConnected();
+
+    // 未连接就持续重开广播,iPhone 断线后可自动重连(适合长期挂机)
+    if (!conn) {
+      BLEDevice::startAdvertising();
+    }
+
+    Serial.printf("[B板存活] uptime=%lus  空闲内存=%u  队列积压=%u  蓝牙=%s\n",
+                  millis()/1000, ESP.getFreeHeap(),
+                  (unsigned)(cmdQueue ? uxQueueMessagesWaiting(cmdQueue) : 0),
+                  conn ? "已连" : "未连");
+    Serial2.print(conn ? "BLE:1\n" : "BLE:0\n");
+  }
+
+  delay(2);
+}

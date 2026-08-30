@@ -1,0 +1,361 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>   // 异步 web 服务器(库目录里的 ESP_Async_WebServer)
+#include <ESPmDNS.h>
+// ================== A 板 · WiFi 网关(只跑 WiFi + 网页,不碰蓝牙)==================
+// 职责:提供遥控网页;收到网页指令后,原样通过 Serial2 转发给 B 板执行。
+// 接线:A板 D17(TX2) → B板 D16(RX2);A板 GND → B板 GND(共地)。
+// 本版改动:滚动量加大(滚轮 40 / 滚动按钮 60),滚动更快。
+// =================================================================================
+
+// ---------- WiFi ----------
+#define USE_AP false
+const char* WIFI_SSID = "by_dx";
+const char* WIFI_PASS = "pennyliang";
+const char* HOSTNAME  = "esp32ble";
+const char* AP_SSID = "ESP32-Remote";
+const char* AP_PASS = "12345678";
+
+// ---------- 串口转发(发给 B 板)----------
+#define LINK_BAUD   115200
+#define LINK_TX_PIN 17   // A板 D17 → B板 D16
+#define LINK_RX_PIN 16   // 用于接收 B 板回传的蓝牙状态(需接 B板D17→A板D16)
+
+AsyncWebServer server(80);
+
+void forwardToB(const String& cmd) {
+  Serial2.print(cmd);
+  Serial2.print('\n');
+}
+
+// ============================ 网页 ============================
+const char PAGE[] PROGMEM = R"HTMLPAGE(
+<!DOCTYPE html><html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ESP32 遥控</title>
+<style>
+  :root{--bg:#0f1115;--panel:#1a1d24;--line:#2a2e37;--fg:#e6e8ec;--mut:#8b909a;--accent:#4c8dff;}
+  *{box-sizing:border-box;-webkit-user-select:none;user-select:none;}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,system-ui,"PingFang SC",sans-serif;padding:12px;max-width:520px;margin:0 auto;}
+  h1{font-size:15px;font-weight:600;margin:4px 0 12px;display:flex;align-items:center;gap:8px;}
+  .dot{width:9px;height:9px;border-radius:50%;background:#c0392b;box-shadow:0 0 6px #c0392b;}
+  .dot.on{background:#27ae60;box-shadow:0 0 6px #27ae60;}
+  #pad{height:180px;background:var(--panel);border:1px solid var(--line);border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:13px;text-align:center;touch-action:none;margin-bottom:10px;padding:0 20px;}
+  .row{display:flex;gap:8px;margin-bottom:8px;}
+  button{flex:1;padding:13px 8px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:10px;font-size:14px;cursor:pointer;-webkit-tap-highlight-color:transparent;}
+  button:active{background:var(--accent);border-color:var(--accent);}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px;}
+  .dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px;}
+  .dpad button{padding:16px 0;font-size:20px;}
+  .dpad .ctr{font-size:13px;color:var(--mut);}
+  .step.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+  input[type=text],input[type=number]{padding:12px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:10px;font-size:14px;width:100%;}
+  input[type=text]{flex:2;}
+  .sec{font-size:12px;color:var(--mut);margin:12px 2px 6px;}
+  .sens{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--mut);margin-bottom:10px;}
+  .sens input{flex:1;}
+  #map{position:relative;aspect-ratio:9/19.5;max-width:150px;margin:0 auto 8px;background:var(--panel);border:1px solid var(--line);border-radius:14px;touch-action:none;overflow:hidden;}
+  #map .cross{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid var(--accent);border-radius:50%;pointer-events:none;display:none;}
+  .hint{font-size:11px;color:var(--mut);text-align:center;margin-bottom:10px;}
+</style></head><body>
+  <h1><span id="dot" class="dot"></span>ESP32 遥控 <span id="stat" style="font-size:12px;color:var(--mut)">连接中…</span></h1>
+
+  <div class="sec">绝对定位 · 输入屏幕百分比(左上=0,0 · 右下=100,100 · 正中=50,50)</div>
+  <div class="row">
+    <input id="absx" type="number" min="0" max="100" step="0.1" value="50" placeholder="X %">
+    <input id="absy" type="number" min="0" max="100" step="0.1" value="50" placeholder="Y %">
+  </div>
+  <div class="row">
+    <button onclick="absMove(false)">移动到此</button>
+    <button onclick="absMove(true)">移动并点击</button>
+    <button onclick="absCenter()">回中央</button>
+  </div>
+
+  <div class="sec">绝对定位 · 屏幕映射(轻点=移动 · 拖动=跟随 · 双击=移动并点击)</div>
+  <div id="map"><div id="cross" class="cross"></div></div>
+  <div class="hint">映射区比例≈9:19.5,与被控 iPhone 屏幕比例越接近,落点越准</div>
+
+  <div class="sec">方向微调(轻点走一步 · 按住连续走 · 中间=左键)</div>
+  <div class="row">
+    <button id="big" class="step">大步 127</button>
+    <button id="small" class="step active">小步 10</button>
+  </div>
+  <div class="dpad">
+    <button data-dir="-1,-1">↖</button>
+    <button data-dir="0,-1">↑</button>
+    <button data-dir="1,-1">↗</button>
+    <button data-dir="-1,0">←</button>
+    <button class="ctr" data-dir="0,0">点击</button>
+    <button data-dir="1,0">→</button>
+    <button data-dir="-1,1">↙</button>
+    <button data-dir="0,1">↓</button>
+    <button data-dir="1,1">↘</button>
+  </div>
+
+  <div class="sec">触控板(拖动移动 · 轻点左键 · 滚轮滚动)</div>
+  <div id="pad">拖动 = 移动光标</div>
+  <div class="sens">灵敏度 <input id="sens" type="range" min="1" max="5" step="0.5" value="2"><span id="sv">2.0</span></div>
+  <div class="row">
+    <button onclick="send('C:L')">左键</button>
+    <button onclick="send('C:R')">右键</button>
+    <button id="su">滚 ▲</button>
+    <button id="sd">滚 ▼</button>
+  </div>
+
+  <div class="sec">翻页(iOS 对翻页键的支持通常比滚轮好)</div>
+  <div class="grid">
+    <button onclick="send('K:PGUP')">PgUp</button>
+    <button onclick="send('K:PGDN')">PgDn</button>
+    <button onclick="send('K:HOME')">顶部</button>
+    <button onclick="send('K:END')">底部</button>
+  </div>
+
+  <div class="sec">聚焦搜索框(两个都试,哪个管用用哪个)</div>
+  <div class="row">
+    <button onclick="send('H:ALTD')">Alt+D</button>
+    <button onclick="send('H:ADDR')">地址栏 ⌘L</button>
+  </div>
+
+  <div class="sec">文字输入(英文)</div>
+  <div class="row">
+    <input id="txt" type="text" placeholder="输入文字…">
+    <button onclick="sendText(false)">发送</button>
+    <button onclick="sendText(true)">发送↵</button>
+  </div>
+  <div class="sec">按键</div>
+  <div class="grid">
+    <button onclick="send('K:LEFT')">←</button>
+    <button onclick="send('K:UP')">↑</button>
+    <button onclick="send('K:DOWN')">↓</button>
+    <button onclick="send('K:RIGHT')">→</button>
+    <button onclick="send('K:RETURN')">Enter</button>
+    <button onclick="send('K:ESC')">Esc</button>
+    <button onclick="send('K:TAB')">Tab</button>
+    <button onclick="send('K:BACKSPACE')">⌫</button>
+  </div>
+  <div class="sec">iOS 手势</div>
+  <div class="row">
+    <button onclick="send('H:HOME')">主屏</button>
+    <button onclick="send('H:SEARCH')">搜索</button>
+    <button onclick="send('H:SWITCH')">切换App</button>
+  </div>
+<script>
+  // ---- 发送指令(HTTP,节流)----
+  let busy = false;
+  function send(c){
+    if(busy) return;
+    busy = true;
+    const ctrl = new AbortController();
+    const to = setTimeout(()=>ctrl.abort(), 300);
+    fetch('/cmd?c='+encodeURIComponent(c), {signal: ctrl.signal})
+      .catch(()=>{})
+      .finally(()=>{ clearTimeout(to); busy = false; });
+  }
+
+  // ---- 绝对定位:百分比输入框 ----
+  const LOGMAX = 32767;
+  function clampPct(v){ v = parseFloat(v); if(isNaN(v)) v = 50; return Math.min(100, Math.max(0, v)); }
+  function absMove(click){
+    const px = clampPct(document.getElementById('absx').value);
+    const py = clampPct(document.getElementById('absy').value);
+    const x = Math.round(px/100*LOGMAX);
+    const y = Math.round(py/100*LOGMAX);
+    send((click?'Q:':'P:')+x+','+y);
+    showCross(px/100, py/100);
+  }
+  function absCenter(){
+    document.getElementById('absx').value = 50;
+    document.getElementById('absy').value = 50;
+    absMove(false);
+  }
+
+  // ---- 绝对定位:可视化屏幕映射区 ----
+  const map = document.getElementById('map');
+  const cross = document.getElementById('cross');
+  let mapDown = false, lastTap = 0;
+  function showCross(nx, ny){
+    cross.style.left = (nx*100)+'%';
+    cross.style.top  = (ny*100)+'%';
+    cross.style.display = 'block';
+  }
+  function mapPos(clientX, clientY){
+    const r = map.getBoundingClientRect();
+    let nx = (clientX - r.left) / r.width;
+    let ny = (clientY - r.top)  / r.height;
+    nx = Math.min(1, Math.max(0, nx));
+    ny = Math.min(1, Math.max(0, ny));
+    return {nx, ny};
+  }
+  function mapSend(clientX, clientY, click){
+    const {nx, ny} = mapPos(clientX, clientY);
+    const x = Math.round(nx*LOGMAX), y = Math.round(ny*LOGMAX);
+    send((click?'Q:':'P:')+x+','+y);
+    showCross(nx, ny);
+    document.getElementById('absx').value = (nx*100).toFixed(1);
+    document.getElementById('absy').value = (ny*100).toFixed(1);
+  }
+  map.addEventListener('mousedown', e=>{ mapDown=true; mapSend(e.clientX,e.clientY,false); });
+  window.addEventListener('mousemove', e=>{ if(mapDown) mapSend(e.clientX,e.clientY,false); });
+  window.addEventListener('mouseup', ()=>{ mapDown=false; });
+  map.addEventListener('dblclick', e=>{ mapSend(e.clientX,e.clientY,true); });
+  map.addEventListener('touchstart', e=>{
+    e.preventDefault();
+    const t=e.touches[0];
+    const now=Date.now();
+    const dbl = (now-lastTap)<300;
+    lastTap = now;
+    mapSend(t.clientX, t.clientY, dbl);
+  },{passive:false});
+  map.addEventListener('touchmove', e=>{
+    e.preventDefault();
+    const t=e.touches[0];
+    mapSend(t.clientX, t.clientY, false);
+  },{passive:false});
+
+  // ---- 按住连发工具 ----
+  function hold(btn, fn){
+    let iv;
+    const start=e=>{ e.preventDefault(); fn(); iv=setInterval(fn,120); };
+    const stop=()=>clearInterval(iv);
+    btn.addEventListener('mousedown',start); btn.addEventListener('touchstart',start,{passive:false});
+    ['mouseup','mouseleave','touchend'].forEach(ev=>btn.addEventListener(ev,stop));
+  }
+
+  // ---- 8方向 + 步长 ----
+  let step = 10;
+  const bBig=document.getElementById('big'), bSmall=document.getElementById('small');
+  function setStep(v, on){ step=v; bBig.classList.toggle('active',on===bBig); bSmall.classList.toggle('active',on===bSmall); }
+  bBig.onclick   = ()=>setStep(127,bBig);
+  bSmall.onclick = ()=>setStep(10, bSmall);
+  document.querySelectorAll('.dpad button[data-dir]').forEach(btn=>{
+    const [sx,sy]=btn.dataset.dir.split(',').map(Number);
+    if(sx===0 && sy===0){ btn.onclick=()=>send('C:L'); return; }
+    hold(btn, ()=>send('M:'+(sx*step)+','+(sy*step)));
+  });
+
+  // ---- 文字 ----
+  function sendText(enter){
+    const el=document.getElementById('txt'), v=el.value;
+    if(v) send('T:'+v);
+    if(enter) setTimeout(()=>send('K:RETURN'), 60);
+    el.value='';
+  }
+
+  // ---- 触控板 ----
+  let sens=2.0;
+  const sr=document.getElementById('sens'), sv=document.getElementById('sv');
+  sr.oninput=()=>{ sens=parseFloat(sr.value); sv.textContent=sens.toFixed(1); };
+  const pad=document.getElementById('pad');
+  let last=null, accX=0, accY=0, dist=0, t0=0;
+  function down(x,y){ last={x,y}; accX=accY=dist=0; t0=Date.now(); }
+  function move(x,y){
+    if(!last) return;
+    const dx=x-last.x, dy=y-last.y;
+    accX+=dx*sens; accY+=dy*sens; dist+=Math.abs(dx)+Math.abs(dy);
+    last={x,y};
+  }
+  function up(){ if(last && dist<6 && Date.now()-t0<250) send('C:L'); last=null; }
+  setInterval(()=>{
+    const dx=Math.round(accX), dy=Math.round(accY);
+    if(dx||dy){ accX-=dx; accY-=dy; send('M:'+dx+','+dy); }
+  }, 45);
+  pad.addEventListener('mousedown', e=>down(e.clientX,e.clientY));
+  window.addEventListener('mousemove', e=>{ if(last) move(e.clientX,e.clientY); });
+  window.addEventListener('mouseup', up);
+  pad.addEventListener('touchstart', e=>{e.preventDefault();const t=e.touches[0];down(t.clientX,t.clientY);},{passive:false});
+  pad.addEventListener('touchmove', e=>{e.preventDefault();const t=e.touches[0];move(t.clientX,t.clientY);},{passive:false});
+  pad.addEventListener('touchend', e=>{e.preventDefault();up();},{passive:false});
+  // 滚轮:量加大到 ±40,滚得更快(方向反了就把 40/-40 对调)
+  pad.addEventListener('wheel', e=>{e.preventDefault(); send('S:'+(e.deltaY>0?-40:40));},{passive:false});
+  hold(document.getElementById('su'), ()=>send('S:60'));    // 滚 ▲ 一次滚 60
+  hold(document.getElementById('sd'), ()=>send('S:-60'));   // 滚 ▼ 一次滚 60
+
+  // ---- 蓝牙状态轮询 ----
+  setInterval(()=>{
+    fetch('/status').then(r=>r.json()).then(j=>{
+      const d=document.getElementById('dot'), s=document.getElementById('stat');
+      if(j.ble){ d.classList.add('on'); s.textContent='已连接 iPhone'; }
+      else{ d.classList.remove('on'); s.textContent='等待蓝牙…'; }
+    }).catch(()=>{});
+  }, 1500);
+</script></body></html>
+)HTMLPAGE";
+
+// ============================ B板蓝牙状态回传 ============================
+volatile bool bBleConnected = false;
+
+// ============================ 启动 ============================
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+
+  Serial.println();
+  Serial.println("==== A 板 · WiFi 网关启动 ====");
+
+  if (USE_AP) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.print("热点已开: "); Serial.println(AP_SSID);
+    Serial.print("网址: http://"); Serial.println(WiFi.softAPIP());
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("连接 WiFi");
+    while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+    Serial.println();
+    Serial.print("网址: http://"); Serial.println(WiFi.localIP());
+    if (MDNS.begin(HOSTNAME)) Serial.printf("或 http://%s.local\n", HOSTNAME);
+  }
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncWebServerResponse *response = request->beginChunkedResponse("text/html",
+      [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        size_t total = strlen_P(PAGE);
+        if (index >= total) return 0;
+        size_t chunk = total - index;
+        if (chunk > maxLen) chunk = maxLen;
+        memcpy_P(buffer, PAGE + index, chunk);
+        return chunk;
+      });
+    request->send(response);
+  });
+
+  server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
+    const AsyncWebParameter* p = request->getParam("c");
+    if (p) forwardToB(p->value());
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "application/json",
+                  bBleConnected ? "{\"ble\":true}" : "{\"ble\":false}");
+  });
+
+  server.begin();
+  Serial.println("HTTP(异步) 服务已启动,指令将转发给 B 板");
+}
+
+// ============================ 主循环 ============================
+void loop() {
+  // 读 B 板回传的蓝牙状态(接了 B板D17→A板D16 才有;没接则圆点恒灭,不影响功能)
+  static String rx;
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\n') {
+      rx.trim();
+      if (rx == "BLE:1") bBleConnected = true;
+      else if (rx == "BLE:0") bBleConnected = false;
+      rx = "";
+    } else if (rx.length() < 32) {
+      rx += c;
+    }
+  }
+
+  static unsigned long lastBeat = 0;
+  if (millis() - lastBeat > 3000) {
+    lastBeat = millis();
+    Serial.printf("[A板存活] uptime=%lus  空闲内存=%u  IP=%s\n",
+                  millis()/1000, ESP.getFreeHeap(),
+                  WiFi.localIP().toString().c_str());
+  }
+}
